@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.schemas import DispatchRunPayload
 from app.store import store
 from app.services import runtime_session, callback_hook
 
@@ -213,11 +214,18 @@ def pipeline_rpa_lifecycle() -> dict[str, object]:
 
 
 @app.post("/api/pipeline/crawl-schedule")
-def pipeline_crawl_schedule() -> dict[str, object]:
-    """触发调度采集流程。"""
+def pipeline_crawl_schedule(payload: DispatchRunPayload | None = None) -> dict[str, object]:
+    """触发调度采集流程（窗口化：同计划同窗口只有一笔排队任务）。"""
     from app.services import SchedulerService
     sched_svc = SchedulerService()
-    result = sched_svc.schedule_crawl_jobs()
+    kwargs = {}
+    if payload is not None:
+        kwargs = {
+            "fired_at": payload.fired_at,
+            "scheduled_at": payload.scheduled_at,
+            "late_policy": payload.late_policy,
+        }
+    result = sched_svc.schedule_crawl_jobs(**kwargs)
     return {"ok": True, "scheduled": result}
 
 

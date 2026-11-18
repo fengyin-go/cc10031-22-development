@@ -119,6 +119,11 @@ class DataChannel:
         with self._lock:
             return sum(1 for m in self._messages if not m.confirmed)
 
+    def reset(self) -> None:
+        with self._lock:
+            self._seq = 0
+            self._messages = []
+
 
 # ---------------------------------------------------------------------------
 # 脏数据隔离区 (DirtyDataVault)
@@ -198,6 +203,11 @@ class DirtyDataVault:
                 "by_reason": by_reason,
             }
 
+    def reset(self) -> None:
+        with self._lock:
+            self._seq = 0
+            self._records = []
+
 
 # ---------------------------------------------------------------------------
 # 采集记录 (CollectRecord) — 每次采集产出的结构化数据
@@ -273,6 +283,11 @@ class CollectRecordStore:
                 "unvalidated": len(self._entries) - validated,
                 "by_source": by_source,
             }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._seq = 0
+            self._entries = []
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +372,177 @@ class FailureRecovery:
                 "pending": pending,
             }
 
+    def reset(self) -> None:
+        with self._lock:
+            self._seq = 0
+            self._entries = []
+
+
+# ---------------------------------------------------------------------------
+# 到期采集任务清单 (DueTaskManifest) — 调度窗口 + 触发凭证的可核对产物
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DueTaskManifest:
+    """到期采集任务清单：一次调度扫描中，一个到期计划在一个调度窗口的唯一凭证。
+
+    同一 plan_id + window_id 只会生成一条清单，重复调度只累加 dispatch_count，
+    不会再产生新的排队任务。
+    """
+    manifest_id: int
+    manifest_no: str
+    plan_id: int
+    plan_name: str
+    window_id: str
+    window_start: str
+    window_end: str
+    trigger_credential: dict[str, Any]
+    task_id: int | None = None
+    task_number: str | None = None
+    status: str = "待入队"  # 待入队 / 排队中 / 执行中 / 已完成 / 已取消 / 执行失败
+    late: bool = False
+    late_note: str = ""
+    late_policy: str = "补当前窗口"
+    dispatch_count: int = 1
+    fired_at: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class DueTaskManifestStore:
+    """到期采集任务清单存储：调度窗口与触发凭证原子落库，支撑窗口级幂等。
+
+    用法::
+
+        manifest = store.due_manifests.create_or_get(plan_id, window_id, ...)
+        if manifest.dispatch_count == 1: ...  # 首次调度
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._manifests: list[DueTaskManifest] = []
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._manifests)
+
+    def find(self, plan_id: int, window_id: str) -> DueTaskManifest | None:
+        """按 计划+窗口 幂等键查找已存在清单（同窗口重复调度的判定依据）。"""
+        with self._lock:
+            for m in self._manifests:
+                if m.plan_id == plan_id and m.window_id == window_id:
+                    return m
+            return None
+
+    def create_or_get(
+        self,
+        *,
+        manifest_no: str,
+        plan_id: int,
+        plan_name: str,
+        window_id: str,
+        window_start: str,
+        window_end: str,
+        trigger_credential: dict[str, Any],
+        late: bool,
+        late_note: str,
+        late_policy: str,
+        fired_at: str,
+    ) -> tuple[DueTaskManifest, bool]:
+        """原子生成窗口凭证：已存在则只累加调度次数，返回 (清单, 是否首次创建)。"""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            for existing in self._manifests:
+                if existing.plan_id == plan_id and existing.window_id == window_id:
+                    existing.dispatch_count += 1
+                    existing.updated_at = now_iso
+                    return existing, False
+            self._seq += 1
+            manifest = DueTaskManifest(
+                manifest_id=self._seq,
+                manifest_no=manifest_no,
+                plan_id=plan_id,
+                plan_name=plan_name,
+                window_id=window_id,
+                window_start=window_start,
+                window_end=window_end,
+                trigger_credential=dict(trigger_credential),
+                late=late,
+                late_note=late_note,
+                late_policy=late_policy,
+                fired_at=fired_at,
+            )
+            self._manifests.append(manifest)
+            return manifest, True
+
+    def bind_task(self, manifest_id: int, task_id: int, task_number: str) -> bool:
+        """清单与排队任务绑定（同窗口只允许绑定一次）。"""
+        with self._lock:
+            for m in self._manifests:
+                if m.manifest_id == manifest_id:
+                    m.task_id = task_id
+                    m.task_number = task_number
+                    m.status = "排队中"
+                    m.updated_at = datetime.now(timezone.utc).isoformat()
+                    return True
+            return False
+
+    def sync_status(self, task_id: int, status: str) -> bool:
+        """排队任务状态联动回写清单待办。"""
+        with self._lock:
+            for m in self._manifests:
+                if m.task_id == task_id:
+                    m.status = status
+                    m.updated_at = datetime.now(timezone.utc).isoformat()
+                    return True
+            return False
+
+    def list_all(
+        self,
+        *,
+        plan_id: int | None = None,
+        window_id: str | None = None,
+        status: str | None = None,
+    ) -> list[DueTaskManifest]:
+        with self._lock:
+            result = list(self._manifests)
+        if plan_id is not None:
+            result = [m for m in result if m.plan_id == plan_id]
+        if window_id:
+            result = [m for m in result if m.window_id == window_id]
+        if status:
+            result = [m for m in result if m.status == status]
+        return result
+
+    def to_dict(self, manifest: DueTaskManifest) -> dict[str, Any]:
+        return {
+            "manifest_id": manifest.manifest_id,
+            "manifest_no": manifest.manifest_no,
+            "plan_id": manifest.plan_id,
+            "plan_name": manifest.plan_name,
+            "window_id": manifest.window_id,
+            "window_start": manifest.window_start,
+            "window_end": manifest.window_end,
+            "trigger_credential": dict(manifest.trigger_credential),
+            "task_id": manifest.task_id,
+            "task_number": manifest.task_number,
+            "status": manifest.status,
+            "late": manifest.late,
+            "late_note": manifest.late_note,
+            "late_policy": manifest.late_policy,
+            "dispatch_count": manifest.dispatch_count,
+            "fired_at": manifest.fired_at,
+            "created_at": manifest.created_at,
+            "updated_at": manifest.updated_at,
+        }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._seq = 0
+            self._manifests = []
+
 
 # ---------------------------------------------------------------------------
 # 增强版 Store — 整合通道、脏数据、采集记录、恢复
@@ -372,6 +558,25 @@ class Store:
         self.dirty_vault = DirtyDataVault()
         self.collect_records = CollectRecordStore()
         self.recovery = FailureRecovery()
+        # 到期采集任务清单：调度窗口 + 触发凭证的可核对凭证
+        self.due_manifests = DueTaskManifestStore()
+
+    # ---- 测试辅助：重置内存仓库到初始种子 ----
+
+    def reset(self) -> None:
+        """恢复初始种子数据并清空所有跨模块运行态，供测试之间隔离。
+
+        全部采用原地清空：不替换 store 自身及其成员实例，保证模块级单例
+        服务持有的引用始终有效。
+        """
+        self._tables.clear()
+        for name, rows in SEED_ROWS.items():
+            self._tables[name] = [dict(row) for row in rows]
+        self.channel.reset()
+        self.dirty_vault.reset()
+        self.collect_records.reset()
+        self.recovery.reset()
+        self.due_manifests.reset()
 
     # ---- 基础数据操作 ----
 

@@ -25,6 +25,113 @@ class TaskQueueService(BaseModuleService):
     ACTION_RULES = {"取消任务": "已取消", "提升优先级": "排队中"}
     NEGATIVE_ACTIONS = []
 
+    # ---- 调度采集：按窗口标识幂等入队 ----
+
+    def enqueue_due_task(
+        self,
+        plan: dict[str, Any],
+        manifest: Any,
+        credential: dict[str, Any],
+    ) -> dict[str, Any]:
+        """把到期采集任务清单落成排队任务；同计划同窗口复用已存在任务。
+
+        去重键：plan_id + window_id（窗口标识）。重复调度直接返回既有任务，
+        保证同一窗口的重复调度只能看到一笔排队任务。
+
+        Returns:
+            {"created": bool, "task_id": int, "task_number": str, "window_id": str}
+        """
+        plan_id = int(plan.get("id", 0))
+        window_id = manifest.window_id
+        existing = self.find_window_task(plan_id, window_id)
+        if existing is not None:
+            return {
+                "created": False,
+                "task_id": int(existing["id"]),
+                "task_number": existing.get("任务编号"),
+                "window_id": window_id,
+            }
+
+        now = datetime.now(timezone.utc)
+        task_number = f"DUETASK-{plan_id}-{window_id}"
+        values = {
+            "任务编号": task_number,
+            "流程名称": str(plan.get("计划名称") or plan.get("绑定流程") or ""),
+            "提交时间": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "优先级": str(plan.get("优先级") or "中"),
+            "预计执行": manifest.window_start,
+            "排队时长": "0s",
+            "当前状态": "排队中",
+        }
+        entry, missing = self.create_entry(values)
+        if entry is None:
+            return {
+                "created": False,
+                "task_id": 0,
+                "task_number": "",
+                "window_id": window_id,
+                "missing": missing,
+            }
+
+        # 窗口溯源字段：排队任务与到期清单、触发凭证一一对应
+        entry["plan_id"] = plan_id
+        entry["window_id"] = window_id
+        entry["manifest_id"] = manifest.manifest_id
+        entry["credential_no"] = credential.get("credential_no")
+        entry["late"] = manifest.late
+        entry["late_note"] = manifest.late_note
+        entry["来源"] = "到期采集任务清单"
+
+        store.channel.publish(
+            topic="rpa.due_task_queued",
+            source=self.MODULE,
+            payload={
+                "task_id": entry["id"],
+                "task_number": task_number,
+                "plan_id": plan_id,
+                "window_id": window_id,
+                "manifest_id": manifest.manifest_id,
+                "credential_no": credential.get("credential_no"),
+            },
+        )
+        return {
+            "created": True,
+            "task_id": int(entry["id"]),
+            "task_number": task_number,
+            "window_id": window_id,
+        }
+
+    def find_window_task(self, plan_id: int, window_id: str) -> dict[str, Any] | None:
+        """按 计划+窗口 幂等键查找已存在的排队任务。"""
+        for row in store.rows(self.MODULE):
+            if row.get("plan_id") == plan_id and row.get("window_id") == window_id:
+                return row
+        return None
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """重写动作入口：取消/提优先级后联动到期清单待办状态。"""
+        entry, message = super().run_action(entry_id, action)
+        if entry is not None and entry.get("window_id"):
+            store.due_manifests.sync_status(entry_id, str(entry.get("status")))
+        return entry, message
+
+    def list_due_tasks(
+        self,
+        *,
+        plan_id: int | None = None,
+        window_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """查询由到期采集任务清单生成的排队任务，支持计划/窗口/状态过滤。"""
+        rows = [row for row in store.rows(self.MODULE) if row.get("window_id")]
+        if plan_id is not None:
+            rows = [row for row in rows if row.get("plan_id") == plan_id]
+        if window_id:
+            rows = [row for row in rows if row.get("window_id") == window_id]
+        if status:
+            rows = [row for row in rows if row.get("status") == status]
+        return rows
+
     # ---- 跨模块业务方法 ----
 
     def consume_steps_to_queue(self) -> dict[str, Any]:
@@ -110,6 +217,10 @@ class TaskQueueService(BaseModuleService):
 
         if result:
             entry["result"] = result
+
+        # 联动更新到期采集任务清单的待办状态
+        if entry.get("window_id"):
+            store.due_manifests.sync_status(task_id, status)
 
         # 完成后写入执行日志通道
         if status in ("已完成", "执行失败"):

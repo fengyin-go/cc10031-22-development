@@ -106,3 +106,81 @@ export async function loadRecoveryStats(): Promise<Record<string, unknown>> {
   if (!response.ok) throw new Error('恢复状态查询失败')
   return await response.json()
 }
+
+// ---- 调度工作台：窗口凭证与到期采集任务清单 ----
+
+export type DispatchRunOptions = {
+  firedAt?: string
+  scheduledAt?: string
+  latePolicy?: string
+}
+
+export type DueManifest = {
+  manifest_id: number
+  manifest_no: string
+  plan_id: number
+  plan_name: string
+  window_id: string
+  window_start: string
+  window_end: string
+  trigger_credential: Record<string, string | number | boolean | null>
+  task_id: number | null
+  task_number: string | null
+  status: string
+  late: boolean
+  late_note: string
+  late_policy: string
+  dispatch_count: number
+  fired_at: string
+}
+
+/** 触发一轮调度扫描（可模拟迟到：scheduledAt 早于 firedAt） */
+export async function runDispatch(options: DispatchRunOptions = {}): Promise<Record<string, unknown>> {
+  const response = await request('/api/dispatch/run-dispatch', {
+    method: 'POST',
+    body: JSON.stringify({
+      fired_at: options.firedAt ?? null,
+      scheduled_at: options.scheduledAt ?? null,
+      late_policy: options.latePolicy ?? '补当前窗口',
+    }),
+  })
+  if (!response.ok) throw new Error('调度扫描失败')
+  return await response.json()
+}
+
+/** 到期采集任务清单：按计划、窗口、状态核对凭证与迟到说明 */
+export async function loadManifests(filters: {
+  planId?: number
+  windowId?: string
+  status?: string
+} = {}): Promise<{ items: DueManifest[]; total: number; watermark: Record<string, number> }> {
+  const params = new URLSearchParams()
+  if (filters.planId !== undefined) params.set('plan_id', String(filters.planId))
+  if (filters.windowId) params.set('window_id', filters.windowId)
+  if (filters.status) params.set('status', filters.status)
+  const response = await request(`/api/dispatch/manifests?${params.toString()}`)
+  if (!response.ok) throw new Error('到期采集任务清单读取失败')
+  return await response.json()
+}
+
+/** 到期清单生成的排队任务（窗口溯源） */
+export async function loadDueTasks(filters: {
+  planId?: number
+  windowId?: string
+  status?: string
+} = {}): Promise<{ items: EntryRow[]; total: number }> {
+  const params = new URLSearchParams()
+  if (filters.planId !== undefined) params.set('plan_id', String(filters.planId))
+  if (filters.windowId) params.set('window_id', filters.windowId)
+  if (filters.status) params.set('status', filters.status)
+  const response = await request(`/api/dispatch/due-tasks?${params.toString()}`)
+  if (!response.ok) throw new Error('到期排队任务读取失败')
+  return await response.json()
+}
+
+/** 新到达调度排队水位 */
+export async function loadQueueWatermark(): Promise<{ watermark: Record<string, number> }> {
+  const response = await request('/api/dispatch/watermark')
+  if (!response.ok) throw new Error('排队水位读取失败')
+  return await response.json()
+}
